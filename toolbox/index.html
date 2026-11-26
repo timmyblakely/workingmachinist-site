@@ -980,7 +980,7 @@
         </div>
       </div>
       <div class="result-card accent-blue">
-        <div><div class="result-label">Feed Rate</div><div class="result-sub" id="fsFeedSub">&nbsp;</div></div>
+        <div><div class="result-label">Program Feed Rate</div><div class="result-sub" id="fsFeedSub">&nbsp;</div></div>
         <div class="result-right"><div class="result-numbers"><div class="result-value" id="fsFeedResult"><span class="result-empty">—</span></div><div class="result-unit" id="fsFeedUnit"></div></div>
           <button class="copy-btn-result" onclick="copyFieldValue(this,'fsFeedResult')"><svg style="width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2;"><use href="#icon-copy"/></svg></button>
         </div>
@@ -1168,7 +1168,7 @@
       <div class="input-grid" style="margin-top:18px;">
         <div class="field"><label for="tmToolOffset">Cutter comp offset number (D)</label>
           <div class="input-copy-wrap"><input type="number" id="tmToolOffset" value="1" step="1" min="1" inputmode="numeric"/><button class="copy-btn-inline" onclick="copyFieldValue(this,'tmToolOffset')"><svg style="width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:2;"><use href="#icon-copy"/></svg></button></div>
-          <div class="field-hint">Program always applies G41 cutter compensation with this D offset.</div>
+          <div class="field-hint">Wear offset only. Start at 0.000. Do not enter the cutter radius: the path already allows for it.</div>
         </div>
       </div>
       <div class="setup-row" style="margin-top:18px;gap:22px;">
@@ -2317,62 +2317,92 @@ function tmCalculate() {
   }
   if ([majorIn,cutterIn,flutes,sfmIn,iptIn,depthIn,retractIn,toolOffset].some(v=>isNaN(v)||v<=0)) { tmShowEmpty(); return; }
 
-  const majorRadius = majorIn/2, cutterRadius = cutterIn/2;
-  const Rp = tmSide==='internal' ? (majorRadius - cutterRadius) : (majorRadius + cutterRadius);
-  if (Rp <= 0) { tmShowEmpty(); return; }
+  const internal = tmSide === 'internal';
+  // Minor diameter of a 60-degree thread: internal 1.0825P, external 1.2269P under the major.
+  const minorIn = majorIn - (internal ? 1.0825 : 1.2269) * pitchIn;
+  if (internal ? cutterIn >= minorIn : minorIn <= 0) { tmShowEmpty(); return; }
+  const cutterRadius = cutterIn/2;
+  // Programmed path is the TOOL CENTER, so the D offset holds wear only.
+  const Rp = internal ? (majorIn/2 - cutterRadius) : (minorIn/2 + cutterRadius);
 
   const rpm = (sfmIn*12)/(Math.PI*cutterIn);
-  const feedIn = rpm*flutes*iptIn;
+  const edgeFeed = rpm*flutes*iptIn;
+  // On a circle the tool center and the cutting edge travel different distances.
+  const arcFeed = edgeFeed * (2*Rp) / majorIn;
+  const feedTxt = arcFeed.toFixed(1);
 
   document.getElementById('tmRPMResult').textContent = Math.round(rpm).toLocaleString();
-  document.getElementById('tmFeedResult').textContent = feedIn.toFixed(1);
+  document.getElementById('tmFeedResult').textContent = feedTxt;
   document.getElementById('tmFeedUnit').textContent = 'IPM';
   document.getElementById('tmRPMSub').textContent = cutterIn.toFixed(3) + ' in cutter × ' + flutes + ' fl.';
-  document.getElementById('tmFeedSub').textContent = flutes + ' fl. × ' + iptIn.toFixed(4) + ' in/tooth';
+  document.getElementById('tmFeedSub').textContent = 'Tool center feed. Cutting edge: ' + edgeFeed.toFixed(1) + ' IPM';
 
-  // Forms per revolution: 1 for single-point, or however many the flute length holds for multipoint.
-  const formsPerRev = tmPointType === 'multi' ? Math.max(1, Math.floor(fluteLenIn / pitchIn)) : 1;
-  const zPerRev = pitchIn * formsPerRev;
-  const revolutions = Math.max(1, Math.ceil(depthIn / zPerRev));
-
-  let rotationDir = (tmSide==='internal') === (tmMillDir==='climb') ? 'G03' : 'G02';
-  if (tmHand==='lh') rotationDir = rotationDir==='G02' ? 'G03' : 'G02';
-
-  const fmtN = v => v.toFixed(4);
-  const internal = tmSide === 'internal';
-  const L = Rp/2;                                   // lead-in / lead-out arc radius
-  const stepS = Math.min(0.05, Rp/2);               // short straight move used to start and cancel cutter comp
-  const k = rotationDir === 'G03' ? 1 : -1;
+  // Climb/conventional sets the arc direction; hand then sets whether Z goes up or down.
+  const rotationDir = internal === (tmMillDir==='climb') ? 'G03' : 'G02';
   const oppDir = rotationDir === 'G03' ? 'G02' : 'G03';
-  const bottomZ = -depthIn;
+  const k = rotationDir === 'G03' ? 1 : -1;
+  const zSign = (rotationDir === 'G03') === (tmHand === 'rh') ? 1 : -1;
   const compSign = ((rotationDir === 'G03') === internal) ? 'G41' : 'G42';
-  const startX = internal ? 0 : (Rp + 2*L);         // external: start clear of the stud; internal: start near hole center
-  const startY = k * stepS;
-  const feedTxt = feedIn.toFixed(1);
+  const bottomZ = -depthIn;
+
+  // Passes: single point = one helix over the whole length.
+  // Multipoint = one revolution (one pitch of Z) per pass, then step by the flute coverage.
+  const passes = [];
+  let formsPerRev = 1;
+  if (tmPointType === 'multi') {
+    formsPerRev = Math.max(1, Math.floor(fluteLenIn / pitchIn + 1e-6));
+    const n = Math.max(1, Math.ceil(depthIn / (formsPerRev * pitchIn) - 1e-6));
+    for (let i = 0; i < n; i++) {
+      const low = bottomZ + i * formsPerRev * pitchIn;
+      passes.push({ z: zSign > 0 ? low : low + pitchIn, revs: 1 });
+    }
+    if (zSign < 0) passes.reverse();
+  } else {
+    let revs = Math.max(1, Math.ceil(depthIn / pitchIn - 1e-6));
+    if (zSign < 0) while (bottomZ + revs * pitchIn < pitchIn - 1e-6) revs++;   // start above the surface
+    passes.push({ z: zSign > 0 ? bottomZ : bottomZ + revs * pitchIn, revs: revs });
+  }
+
+  const f = v => (Math.abs(v) < 0.00005 ? 0 : v).toFixed(4);
+  const r = Rp/2;                                           // lead-in / lead-out quarter arc radius
+  const gap = Math.max(r, (majorIn - minorIn)/2 + 0.05);
+  const home = internal ? {x: 0, y: 0} : {x: Rp + r + gap, y: 0};   // clear of the part
+  const arcX = internal ? Rp - r : Rp + r;
+  const inPt = {x: arcX, y: -k*r}, outPt = {x: arcX, y: k*r};
+  const leadDir = internal ? rotationDir : oppDir;
+  const inIJ = internal ? 'I0. J' + f(k*r) : 'I0. J' + f(k*r);
+  const outIJ = 'I' + f(internal ? -r : r) + ' J0.';
+  const threadName = document.getElementById('tmThread').selectedOptions[0].textContent.replace(/[×]/g,'X').replace(/[^ -~]/g,'-').replace(/[()]/g,'');
 
   let lines = [];
   lines.push('(TWM THREAD MILL PROGRAM)');
-  lines.push('(THREAD: ' + document.getElementById('tmThread').selectedOptions[0].textContent + ', ' + tmSide.toUpperCase() + ', ' + tmHand.toUpperCase() + ', SINGLE START, ' + (tmPointType==='multi' ? 'MULTIPOINT (' + formsPerRev + ' FORMS/REV)' : 'SINGLE POINT') + ')');
-  lines.push('(CUTTER DIA: ' + fmtN(cutterIn) + '"  MAJOR DIA: ' + fmtN(majorIn) + '"  PITCH: ' + fmtN(pitchIn) + '")');
-  lines.push('(SPINDLE: ' + Math.round(rpm) + ' RPM   FEED: ' + feedTxt + ' IPM   MILLING: ' + tmMillDir.toUpperCase() + ')');
-  lines.push('(VERIFY ALL PARAMETERS, WORK OFFSET, AND TOOL DATA — SIMULATE BEFORE RUNNING)');
+  lines.push('(THREAD: ' + threadName + ', ' + tmSide.toUpperCase() + ', ' + tmHand.toUpperCase() + ', SINGLE START)');
+  lines.push(tmPointType==='multi' ? '(MULTIPOINT - ' + formsPerRev + ' FORMS - ' + passes.length + ' PASSES)' : '(SINGLE POINT)');
+  lines.push('(CUTTER DIA: ' + f(cutterIn) + '  MAJOR DIA: ' + f(majorIn) + '  PITCH: ' + f(pitchIn) + ')');
+  lines.push('(SPINDLE: ' + Math.round(rpm) + ' RPM   MILLING: ' + tmMillDir.toUpperCase() + ')');
+  lines.push('(EDGE FEED: ' + edgeFeed.toFixed(1) + ' IPM   TOOL CENTER FEED: ' + feedTxt + ' IPM)');
+  lines.push('(D' + toolOffset + ' IS WEAR ONLY - START AT 0. - DO NOT ENTER CUTTER RADIUS)');
+  lines.push('(PART ZERO: X Y AT THREAD CENTER, Z AT TOP SURFACE)');
+  lines.push('(VERIFY ALL PARAMETERS AND SIMULATE BEFORE RUNNING)');
   lines.push('G20 G90 G94 G17 G40 G49 G80');
-  lines.push('T01 M06 (THREAD MILL ' + fmtN(cutterIn) + '" DIA)');
-  lines.push('G54 G00 X' + fmtN(startX) + ' Y' + fmtN(startY) + '  (START POINT ' + (internal ? 'NEAR HOLE CENTER' : 'CLEAR OF THE STUD') + ')');
+  lines.push('T01 M06 (THREAD MILL ' + f(cutterIn) + ' DIA)');
+  lines.push('G54 G00 X' + f(home.x) + ' Y' + f(home.y));
   lines.push('S' + Math.round(rpm) + ' M03');
-  lines.push('G43 H01 Z' + fmtN(retractIn));
-  lines.push('G01 Z' + fmtN(bottomZ) + ' F' + feedTxt + '  (PLUNGE TO BOTTOM OF THREAD)');
-  lines.push('G91 ' + compSign + ' G01 Y' + fmtN(-k*stepS) + ' D' + toolOffset + ' F' + feedTxt + '  (CUTTER COMP ON - STRAIGHT START-UP MOVE)');
-  if (internal) lines.push(rotationDir + ' X' + fmtN(Rp) + ' Y0. Z0. I' + fmtN(L) + ' J0.  (LEAD-IN ARC)');
-  else lines.push(oppDir + ' X' + fmtN(-2*L) + ' Y0. Z0. I' + fmtN(-L) + ' J0.  (LEAD-IN ARC)');
-  for (let i = 1; i <= revolutions; i++) {
-    lines.push(rotationDir + ' I' + fmtN(-Rp) + ' J0. Z' + fmtN(zPerRev) + '  (REV ' + i + ' OF ' + revolutions + ')');
-  }
-  if (internal) lines.push(rotationDir + ' X' + fmtN(-Rp) + ' Y0. Z0. I' + fmtN(-L) + ' J0.  (LEAD-OUT ARC)');
-  else lines.push(oppDir + ' X' + fmtN(2*L) + ' Y0. Z0. I' + fmtN(L) + ' J0.  (LEAD-OUT ARC)');
-  lines.push('G40 G01 Y' + fmtN(-k*stepS) + '  (CUTTER COMP OFF - STRAIGHT MOVE)');
-  lines.push('G90 G00 Z' + fmtN(retractIn));
+  lines.push('G43 H01 Z' + f(retractIn));
+  passes.forEach((p, n) => {
+    if (passes.length > 1) lines.push('(PASS ' + (n+1) + ' OF ' + passes.length + ')');
+    lines.push('G01 Z' + f(p.z) + ' F' + feedTxt);
+    lines.push(compSign + ' G01 X' + f(inPt.x) + ' Y' + f(inPt.y) + ' D' + toolOffset + ' F' + feedTxt + '  (CUTTER COMP ON)');
+    lines.push(leadDir + ' X' + f(Rp) + ' Y0. ' + inIJ + '  (LEAD-IN ARC)');
+    for (let i = 1; i <= p.revs; i++) {
+      lines.push(rotationDir + ' X' + f(Rp) + ' Y0. I' + f(-Rp) + ' J0. Z' + f(p.z + zSign*i*pitchIn) + '  (REV ' + i + ' OF ' + p.revs + ')');
+    }
+    lines.push(leadDir + ' X' + f(outPt.x) + ' Y' + f(outPt.y) + ' ' + outIJ + '  (LEAD-OUT ARC)');
+    lines.push('G40 G01 X' + f(home.x) + ' Y' + f(home.y) + '  (CUTTER COMP OFF)');
+  });
+  lines.push('G00 Z' + f(retractIn));
   lines.push('G28 G91 Z0.');
+  lines.push('G90');
   lines.push('M30');
   document.getElementById('tmCodeOutput').textContent = lines.join('\n');
 }
@@ -2386,7 +2416,8 @@ function tmReason() {
   for (const [id, label] of need) { const v = g(id); if (isNaN(v) || v <= 0) return 'enter ' + label + ' above'; }
   const majorIn = tmNativeSystem==='in' ? g('tmMajorDia') : g('tmMajorDia')/IN_TO_MM;
   const cutterIn = g('tmCutterDia');
-  if (tmSide === 'internal' && cutterIn >= majorIn) return 'the thread mill (' + cutterIn.toFixed(3) + '") is too big for this thread: for an internal thread the cutter must be smaller than the major diameter (' + majorIn.toFixed(3) + '")';
+  const pitchMsg = g(tmNativeSystem==='in' ? 'tmTPI' : 'tmPitchMm'); const pIn = tmNativeSystem==='in' ? 1/pitchMsg : pitchMsg/IN_TO_MM;
+  if (tmSide === 'internal' && cutterIn >= majorIn - 1.0825*pIn) return 'the thread mill (' + cutterIn.toFixed(3) + '") is too big for this thread: for an internal thread the cutter must be smaller than the minor diameter (' + (majorIn - 1.0825*pIn).toFixed(4) + '")';
   return 'enter valid thread, cutter, and cutting parameters above';
 }
 function tmShowEmpty() {
@@ -2440,7 +2471,7 @@ function openModal(html) {
   document.getElementById('modalContent').innerHTML = html;
   document.getElementById('modalOverlay').classList.add('active');
 }
-const HELP = {"home": ["Home screen", "Your starting point. Pick a tool from the buttons, or use the quick tools right here.", ["Quick Convert: type an inch value and see millimeters and the nearest 1/64 fraction instantly. Type in the left box; the labels follow the unit you have selected.", "Calculator: a standard shop calculator with memory keys (MC, MR, M+, M-). Your last calculations are kept in the history list.", "Drill Chart: type a decimal size to find the closest fraction, number or letter drill, plus the next larger and next smaller. Filter with All / Fraction / Number / Letter.", "Tool buttons: F1 Geometry, F2 Machining and F3 Reference. Tap one, or use the list on the left."], ["The IN / MM switch at the top changes the units for every tool, and converts values you have already typed.", "The Sound button turns the key clicks on or off.", "Everything runs offline once the file is on your device. Nothing is sent anywhere.", "On every tool page, tap the ? How it works button for that tool's instructions."]], "cnc": ["CNC Angle", "Works out the long or short side of an angled cut on tube or bar, so you can program the cut from a print angle.", ["Enter the tube width and the cut angle (degrees).", "Enter either the long side or the short side. The other one solves automatically.", "Check the Print reference table for known part variants, then use Copy All to copy the results."], ["Formula used: short = long - (width x tan(90 - angle)).", "Angle is measured the way your print shows it. Double-check against one known part before cutting a run."]], "saw": ["Saw Angle", "Goes the other direction: you know the two side lengths and the stock width, and it returns the cut angle for the saw or vise.", ["Enter the long side and the short side (inches).", "Enter the stock width (width of the tube or bar).", "Read the Cut Angle result. Use Copy All to copy it."], ["Long side must be longer than the short side.", "Use the same units for all three numbers."]], "trig": ["Triangle & Trig Solver", "Solves a right triangle. Angle C is always 90 degrees.", ["Enter any two values: two sides, or a side and an angle.", "The other sides and angles fill in automatically.", "Clear a field and type a new one to re-solve."], ["Side c is the hypotenuse, side a is opposite angle A, side b is opposite angle B.", "Good for tapers, sine-bar heights and checking print dimensions."]], "bolt": ["Bolt Hole Calculator", "Gives X/Y coordinates for holes evenly spaced on a bolt circle, measured from the center.", ["Enter the circle diameter and number of holes.", "Set the start angle: 0 degrees is 3 o'clock, 90 is 12 o'clock.", "Choose CCW or CW for the hole numbering direction.", "Read the coordinate table, or pick Plain X/Y or G81 Cycle Block and tap Copy Code to paste into your program."], ["Coordinates are from the circle center, so set your work offset to the center first.", "Always simulate pasted code before running it."]], "fs": ["Feeds & Speeds", "Calculates spindle RPM and feed rate from the tool and material, and optionally the material removal rate.", ["Enter tool diameter and number of flutes.", "Pick a material. It fills in a starting SFM and chip load, which you can overwrite.", "Optional: enter depth and width of cut to get the material removal rate (MRR).", "Read the RPM and feed rate results."], ["The numbers are carbide starting points. Adjust for coating, rigidity and your tooling vendor's data.", "Formulas: RPM = SFM x 3.82 / diameter. Feed = RPM x flutes x chip load."]], "tap": ["Drill & Tap", "Finds the tap drill diameter for a thread, for a cut tap or a form tap.", ["Pick a thread size, or enter the major diameter and threads per inch (or mm pitch).", "Choose Cut Tap or Form Tap, and the percent thread you want.", "Read the tap drill diameter and round to the nearest available drill."], ["Cut taps default to 75 percent thread and form taps to 65 percent.", "Form tap values are a starting point: check your tap maker's chart."]], "holegen": ["Hole Making Generator", "Recommends how to make a hole (drill, drill and ream, or drill and bore) based on size, tolerance and finish.", ["Enter the finished hole diameter and the plus/minus tolerance.", "Choose the surface finish: Rough, Standard or Fine.", "Read the recommended process, the drill size (inch and metric) and the finishing operation."], ["Roughly: drill to size holds +/-.003 to .005, reaming holds +/-.0005 to .001, boring is for tighter than about +/-.0005.", "Read 'How this decision is made' at the bottom of the tool for the rules behind it."]], "threadmill": ["Fanuc Thread Mill", "Generates a Fanuc G-code program to thread mill an internal or external thread.", ["Pick the thread size, or enter major diameter and pitch.", "Enter the thread mill diameter, flutes, flute length, SFM, chip load, thread length, Z retract and the D offset number.", "Choose internal or external, right or left hand, climb or conventional, and single point or multipoint.", "Read the RPM and feed, then tap Copy Code to copy the program."], ["The program always runs in inches (G20) with G41 cutter compensation using your D offset.", "Always verify the tool path direction, work offset, tool length offset and spindle direction, and simulate before running."]], "chamfer": ["Chamfer & Countersink", "Gives the Z depth to cut a chamfer or countersink with a chamfer mill, spot drill or countersink.", ["Pick the tool's included angle (60 to 120 degrees) and its flat tip diameter. Use 0 for a pointed tool.", "Choose Hole chamfer / C'sink or Edge chamfer.", "Enter the diameter at the surface (and the existing hole diameter for a hole), or the chamfer size.", "Read the Tool Tip Z Depth and chamfer width."], ["Tap a row in the 82 degree flat head screw table to fill in a countersink for that screw.", "Add .005 to .010 to sink a flat head screw below the surface.", "Formula: Z = (D - tip) / 2 / tan(angle / 2)."]], "gmcode": ["G-Code / M-Code Reference", "A searchable look-up of common codes for Fanuc mill, Fanuc lathe and Haas mill.", ["Pick a control: Fanuc Mill, Fanuc Lathe or Haas Mill.", "Tap any code for a full explanation. Codes with a diagram icon also show a simple picture."], ["Check your own machine's manual. Cycle details vary between controls and options."]], "conv": ["Unit Converter", "Converts between inches and millimeters, and from feet-inches-fractions to decimal.", ["Inches / Millimeters: type in either box to convert to the other.", "Feet - Inches - Fraction: enter feet, inches and a fraction (or decimal) to get decimal inches and feet.", "Use the fraction chart (1/64 to 1 inch) to look up decimal and mm values."], ["Handy for reading a tape measure or a print that mixes fractions and decimals."]], "gdt": ["GD&T Symbol Reference", "A quick reference for geometric tolerancing symbols.", ["Tap any symbol to see what it means, how it is read on a print, and a simple diagram."], ["Use it with the Print Check tool when a print calls out position or form."]], "fits": ["Fits & Tolerances (ISO)", "Looks up ISO 286 hole-basis fits (like H7/g6) and gives the hole and shaft limits.", ["Enter the nominal size in inches.", "Choose a fit. The hole and shaft size limits and the clearance or interference appear.", "The table lists all common fits at this size: tap a row to select it."], ["Positive clearance means a gap. Negative means interference.", "Sizes up to 500 mm (19.68 inches). Inches are converted to mm for the lookup, then converted back."]], "print": ["Print Check", "Checks a dimension against your customer's title block tolerance, checks a measured part, and calculates true position.", ["Title block: choose the customer title block (or enter .X, .XX, .XXX, .XXXX and angle tolerances) and tap Save to keep it on this device.", "The dimension: enter it exactly as printed, with the same decimal places. Add the print's own plus/minus only if the dimension has one.", "Read the high limit, aim (middle) and low limit.", "Optional: enter a measured size to see pass or fail.", "True position: pick Hole or Pin, MMC or RFS, then enter tolerance, nominal X/Y and measured X/Y and size."], ["Saved title blocks stay on this computer or phone.", "True position diameter = 2 x sqrt(dx squared + dy squared). At MMC, bonus tolerance is added as the feature moves off MMC.", "Datums are assumed to be the X/Y zero your measurements came from."]], "books": ["Books & Guides", "Links to The Working Machinist books on Amazon.", ["Tap View on Amazon, or tap a cover.", "On a computer, scan the QR code with your phone camera to open the book on your phone."], ["The book guides go deeper on FANUC macros, parameters and setup documentation."]]};
+const HELP = {"home": ["Home screen", "Your starting point. Pick a tool from the buttons, or use the quick tools right here.", ["Quick Convert: type an inch value and see millimeters and the nearest 1/64 fraction instantly. Type in the left box; the labels follow the unit you have selected.", "Calculator: a standard shop calculator with memory keys (MC, MR, M+, M-). Your last calculations are kept in the history list.", "Drill Chart: type a decimal size to find the closest fraction, number or letter drill, plus the next larger and next smaller. Filter with All / Fraction / Number / Letter.", "Tool buttons: F1 Geometry, F2 Machining and F3 Reference. Tap one, or use the list on the left."], ["The IN / MM switch at the top changes the units for every tool, and converts values you have already typed.", "The Sound button turns the key clicks on or off.", "Everything runs offline once the file is on your device. Nothing is sent anywhere.", "On every tool page, tap the ? How it works button for that tool's instructions."]], "cnc": ["CNC Angle", "Works out the long or short side of an angled cut on tube or bar, so you can program the cut from a print angle.", ["Enter the tube width and the cut angle (degrees).", "Enter either the long side or the short side. The other one solves automatically.", "Check the Print reference table for known part variants, then use Copy All to copy the results."], ["Formula used: short = long - (width x tan(90 - angle)).", "Angle is measured the way your print shows it. Double-check against one known part before cutting a run."]], "saw": ["Saw Angle", "Goes the other direction: you know the two side lengths and the stock width, and it returns the cut angle for the saw or vise.", ["Enter the long side and the short side (inches).", "Enter the stock width (width of the tube or bar).", "Read the Cut Angle result. Use Copy All to copy it."], ["Long side must be longer than the short side.", "Use the same units for all three numbers."]], "trig": ["Triangle & Trig Solver", "Solves a right triangle. Angle C is always 90 degrees.", ["Enter any two values: two sides, or a side and an angle.", "The other sides and angles fill in automatically.", "Clear a field and type a new one to re-solve."], ["Side c is the hypotenuse, side a is opposite angle A, side b is opposite angle B.", "Good for tapers, sine-bar heights and checking print dimensions."]], "bolt": ["Bolt Hole Calculator", "Gives X/Y coordinates for holes evenly spaced on a bolt circle, measured from the center.", ["Enter the circle diameter and number of holes.", "Set the start angle: 0 degrees is 3 o'clock, 90 is 12 o'clock.", "Choose CCW or CW for the hole numbering direction.", "Read the coordinate table, or pick Plain X/Y or G81 Cycle Block and tap Copy Code to paste into your program."], ["Coordinates are from the circle center, so set your work offset to the center first.", "Always simulate pasted code before running it."]], "fs": ["Feeds & Speeds", "Calculates spindle RPM and feed rate from the tool and material, and optionally the material removal rate.", ["Enter tool diameter and number of flutes.", "Pick a material. It fills in a starting SFM and chip load, which you can overwrite.", "Optional: enter depth and width of cut to get the material removal rate (MRR).", "Read the RPM and feed rate results."], ["The numbers are carbide starting points. Adjust for coating, rigidity and your tooling vendor's data.", "Formulas: RPM = SFM x 3.82 / diameter. Feed = RPM x flutes x chip load."]], "tap": ["Drill & Tap", "Finds the tap drill diameter for a thread, for a cut tap or a form tap.", ["Pick a thread size, or enter the major diameter and threads per inch (or mm pitch).", "Choose Cut Tap or Form Tap, and the percent thread you want.", "Read the tap drill diameter and round to the nearest available drill."], ["Cut taps default to 75 percent thread and form taps to 65 percent.", "Form tap values are a starting point: check your tap maker's chart."]], "holegen": ["Hole Making Generator", "Recommends how to make a hole (drill, drill and ream, or drill and bore) based on size, tolerance and finish.", ["Enter the finished hole diameter and the plus/minus tolerance.", "Choose the surface finish: Rough, Standard or Fine.", "Read the recommended process, the drill size (inch and metric) and the finishing operation."], ["Roughly: drill to size holds +/-.003 to .005, reaming holds +/-.0005 to .001, boring is for tighter than about +/-.0005.", "Read 'How this decision is made' at the bottom of the tool for the rules behind it."]], "threadmill": ["Fanuc Thread Mill", "Generates a Fanuc G-code program to thread mill an internal or external thread.", ["Pick the thread size, or enter major diameter and pitch.", "Enter the thread mill diameter, flutes, flute length, SFM, chip load, thread length, Z retract and the D offset number.", "Choose internal or external, right or left hand, climb or conventional, and single point or multipoint.", "Read the RPM and feed, then tap Copy Code to copy the program."], ["The program runs in inches (G20) and programs the tool center. Cutter comp (G41 or G42) uses your D offset for wear only. Start at 0.000.", "The program feed is the tool center feed, adjusted for the circle. Your chip load applies at the cutting edge.", "Always verify the tool path direction, work offset, tool length offset and spindle direction, and simulate before running."]], "chamfer": ["Chamfer & Countersink", "Gives the Z depth to cut a chamfer or countersink with a chamfer mill, spot drill or countersink.", ["Pick the tool's included angle (60 to 120 degrees) and its flat tip diameter. Use 0 for a pointed tool.", "Choose Hole chamfer / C'sink or Edge chamfer.", "Enter the diameter at the surface (and the existing hole diameter for a hole), or the chamfer size.", "Read the Tool Tip Z Depth and chamfer width."], ["Tap a row in the 82 degree flat head screw table to fill in a countersink for that screw.", "Add .005 to .010 to sink a flat head screw below the surface.", "Formula: Z = (D - tip) / 2 / tan(angle / 2)."]], "gmcode": ["G-Code / M-Code Reference", "A searchable look-up of common codes for Fanuc mill, Fanuc lathe and Haas mill.", ["Pick a control: Fanuc Mill, Fanuc Lathe or Haas Mill.", "Tap any code for a full explanation. Codes with a diagram icon also show a simple picture."], ["Check your own machine's manual. Cycle details vary between controls and options."]], "conv": ["Unit Converter", "Converts between inches and millimeters, and from feet-inches-fractions to decimal.", ["Inches / Millimeters: type in either box to convert to the other.", "Feet - Inches - Fraction: enter feet, inches and a fraction (or decimal) to get decimal inches and feet.", "Use the fraction chart (1/64 to 1 inch) to look up decimal and mm values."], ["Handy for reading a tape measure or a print that mixes fractions and decimals."]], "gdt": ["GD&T Symbol Reference", "A quick reference for geometric tolerancing symbols.", ["Tap any symbol to see what it means, how it is read on a print, and a simple diagram."], ["Use it with the Print Check tool when a print calls out position or form."]], "fits": ["Fits & Tolerances (ISO)", "Looks up ISO 286 hole-basis fits (like H7/g6) and gives the hole and shaft limits.", ["Enter the nominal size in inches.", "Choose a fit. The hole and shaft size limits and the clearance or interference appear.", "The table lists all common fits at this size: tap a row to select it."], ["Positive clearance means a gap. Negative means interference.", "Sizes up to 500 mm (19.68 inches). Inches are converted to mm for the lookup, then converted back."]], "print": ["Print Check", "Checks a dimension against your customer's title block tolerance, checks a measured part, and calculates true position.", ["Title block: choose the customer title block (or enter .X, .XX, .XXX, .XXXX and angle tolerances) and tap Save to keep it on this device.", "The dimension: enter it exactly as printed, with the same decimal places. Add the print's own plus/minus only if the dimension has one.", "Read the high limit, aim (middle) and low limit.", "Optional: enter a measured size to see pass or fail.", "True position: pick Hole or Pin, MMC or RFS, then enter tolerance, nominal X/Y and measured X/Y and size."], ["Saved title blocks stay on this computer or phone.", "True position diameter = 2 x sqrt(dx squared + dy squared). At MMC, bonus tolerance is added as the feature moves off MMC.", "Datums are assumed to be the X/Y zero your measurements came from."]], "books": ["Books & Guides", "Links to The Working Machinist books on Amazon.", ["Tap View on Amazon, or tap a cover.", "On a computer, scan the QR code with your phone camera to open the book on your phone."], ["The book guides go deeper on FANUC macros, parameters and setup documentation."]]};
 const HELP_ORDER = ["home", "cnc", "saw", "trig", "bolt", "fs", "tap", "holegen", "threadmill", "chamfer", "gmcode", "conv", "gdt", "fits", "print", "books"];
 function helpCurrent() { const p = document.querySelector('.tab-panel.active'); return p ? p.id.replace('tab-','') : 'home'; }
 function openHelp(tab) {
